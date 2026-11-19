@@ -40,7 +40,8 @@ Counts are saved between sessions and shared across all characters on the accoun
 WoW Forever runs on the modern client, where addons can't read the combat log.
 The satchel isn't used up; it goes on a 10 minute cooldown. Outch notices that
 cooldown starting (or you casting the satchel's spell), then looks for one of the
-three potions appearing in your bags within 3 seconds. If none does, it counts an
+three potions appearing in your bags (or a "You create/receive" loot message for one)
+within 5 seconds. If none does, it counts an
 Outch and reads the damage from your own health dropping (falling back to 216 if your
 health can't be read at that moment).
 

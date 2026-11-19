@@ -19,7 +19,7 @@ local OUTCOME_ITEMS = {
 
 -- Seconds between using the satchel and a potion appearing that we still
 -- treat as the same use.
-local WINDOW = 3
+local WINDOW = 5
 
 -- Damage the satchel deals; used only if your health can't be read.
 local OUTCH_DAMAGE = 216
@@ -42,7 +42,6 @@ local healthLosses = {}  -- recent drops in your health: { time, amount }
 local lastHealth
 local lastUseTime = -1000
 local lastCooldownStart
-local openFrames = {}    -- vendor/bank/mail/trade etc. currently open
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -75,8 +74,42 @@ end
 
 -- Potions arriving while you're at a vendor, bank, mailbox or trade window
 -- are bought/moved, not from the satchel.
+local TRANSFER_FRAMES = {
+    "MerchantFrame", "BankFrame", "MailFrame", "TradeFrame",
+    "GuildBankFrame", "AuctionHouseFrame", "AuctionFrame",
+}
 local function IsBusy()
-    return next(openFrames) ~= nil
+    for _, name in ipairs(TRANSFER_FRAMES) do
+        local f = _G[name]
+        if f and f.IsShown and f:IsShown() then return true end
+    end
+    return false
+end
+
+-- Turn a GlobalStrings format like "You create: %s." into a Lua pattern.
+local function FormatToPattern(fmt)
+    local p = fmt:gsub("([%(%)%.%[%]%*%+%-%?%^%$])", "%%%1")
+    p = p:gsub("%%%%s", "(.+)")
+    p = p:gsub("%%%%d", "(%%d+)")
+    return "^" .. p .. "$"
+end
+
+local SELF_LOOT_PATTERNS = {}
+for _, key in ipairs({
+    "LOOT_ITEM_CREATED_SELF", "LOOT_ITEM_CREATED_SELF_MULTIPLE",
+    "LOOT_ITEM_PUSHED_SELF", "LOOT_ITEM_PUSHED_SELF_MULTIPLE",
+    "LOOT_ITEM_SELF", "LOOT_ITEM_SELF_MULTIPLE",
+}) do
+    if type(_G[key]) == "string" then
+        table.insert(SELF_LOOT_PATTERNS, FormatToPattern(_G[key]))
+    end
+end
+
+local function IsSelfLoot(msg)
+    for _, pattern in ipairs(SELF_LOOT_PATTERNS) do
+        if msg:match(pattern) then return true end
+    end
+    return false
 end
 
 ---------------------------------------------------------------------------
@@ -115,6 +148,18 @@ end
 
 local function Resolve()
     local now = GetTime()
+
+    -- The bag scan and the loot message can both report the same potion;
+    -- keep only one per kind within the window.
+    for j = #recentGains, 2, -1 do
+        for k = 1, j - 1 do
+            local a, b = recentGains[j], recentGains[k]
+            if a.key == b.key and math.abs(a.time - b.time) <= WINDOW then
+                table.remove(recentGains, j)
+                break
+            end
+        end
+    end
 
     local i = 1
     while i <= #pendingUses do
@@ -241,45 +286,15 @@ SafeRegister("PLAYER_ENTERING_WORLD")
 SafeRegister("BAG_UPDATE_DELAYED")
 SafeRegister("BAG_UPDATE_COOLDOWN")
 SafeRegister("SPELL_UPDATE_COOLDOWN")
-SafeRegister("PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
-SafeRegister("PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
+SafeRegister("CHAT_MSG_LOOT")
 pcall(frame.RegisterUnitEvent, frame, "UNIT_HEALTH", "player")
 pcall(frame.RegisterUnitEvent, frame, "UNIT_SPELLCAST_SUCCEEDED", "player")
-
--- Older-style open/close events, in case the interaction manager misses any.
-local CLASSIC_FRAME_EVENTS = {
-    MERCHANT_SHOW = "merchant", MERCHANT_CLOSED = "merchant",
-    BANKFRAME_OPENED = "bank", BANKFRAME_CLOSED = "bank",
-    MAIL_SHOW = "mail", MAIL_CLOSED = "mail",
-    TRADE_SHOW = "trade", TRADE_CLOSED = "trade",
-    GUILDBANKFRAME_OPENED = "guildbank", GUILDBANKFRAME_CLOSED = "guildbank",
-    AUCTION_HOUSE_SHOW = "auction", AUCTION_HOUSE_CLOSED = "auction",
-}
-for event in pairs(CLASSIC_FRAME_EVENTS) do SafeRegister(event) end
-
-local OPEN_EVENTS = {
-    MERCHANT_SHOW = true, BANKFRAME_OPENED = true, MAIL_SHOW = true,
-    TRADE_SHOW = true, GUILDBANKFRAME_OPENED = true, AUCTION_HOUSE_SHOW = true,
-}
-
--- Interaction windows where potions can arrive without the satchel.
-local TRANSFER_INTERACTIONS = {}
-if Enum and Enum.PlayerInteractionType then
-    for _, name in ipairs({
-        "TradePartner", "Merchant", "Banker", "MailInfo", "GuildBanker",
-        "Auctioneer", "AccountBanker", "CharacterBanker", "VoidStorageBanker",
-    }) do
-        local value = Enum.PlayerInteractionType[name]
-        if value ~= nil then TRANSFER_INTERACTIONS[value] = true end
-    end
-end
 
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
         if ... == "Outch" then InitDB() end
 
     elseif event == "PLAYER_ENTERING_WORLD" then
-        wipe(openFrames)
         lastHealth = ReadHealth()
         SnapshotBags()
         -- Don't count a cooldown that was already running when you logged in.
@@ -305,15 +320,18 @@ frame:SetScript("OnEvent", function(self, event, ...)
     elseif event == "UNIT_HEALTH" then
         OnHealthChanged()
 
-    elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" then
-        local kind = ...
-        if TRANSFER_INTERACTIONS[kind] then openFrames["pim" .. kind] = true end
-    elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
-        local kind = ...
-        if kind ~= nil then openFrames["pim" .. tostring(kind)] = nil end
-
-    elseif CLASSIC_FRAME_EVENTS[event] then
-        openFrames[CLASSIC_FRAME_EVENTS[event]] = OPEN_EVENTS[event] or nil
+    elseif event == "CHAT_MSG_LOOT" then
+        local msg = ...
+        if type(msg) ~= "string" or IsSecret(msg) then return end
+        local itemID = tonumber(msg:match("item:(%d+)"))
+        local key = itemID and OUTCOME_ITEMS[itemID]
+        if key then
+            Debug("Loot message: " .. msg)
+            if IsSelfLoot(msg) and not IsBusy() then
+                table.insert(recentGains, { key = key, time = GetTime() })
+                Resolve()
+            end
+        end
     end
 end)
 
