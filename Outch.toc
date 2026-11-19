@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: Outch
 ## Notes: Tracks what you get from opening a Satchel of Potions. Type /outch.
-## Version: 1.0.1
+## Version: 1.1.0
 ## SavedVariables: OutchDB
 
 Outch.lua

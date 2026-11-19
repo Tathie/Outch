@@ -28,6 +28,8 @@ put that number on the `## Interface:` line of `Outch.toc`, or tick "Load out of
   ```
   `x` is the number of satchels that gave that result; `y` is the running total of
   damage taken from Outches.
+- `/outch s` sends the same four lines in /say.
+- `/outch p` sends the same four lines to your party.
 - `/outch reset` sets all counters back to zero.
 - `/outch debug` toggles debug messages showing what the addon sees after each use.
 

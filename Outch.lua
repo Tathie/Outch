@@ -210,9 +210,30 @@ SlashCmdList["OUTCH"] = function(arg)
         debugMode = not debugMode
         Print("Outch: debug " .. (debugMode and "on" or "off") .. ".")
     else
-        Print("Potion of Healing: " .. OutchDB.heal)
-        Print("Mana Potion: " .. OutchDB.mana)
-        Print("Go fast potion: " .. OutchDB.swift)
-        Print(("Outch: %d (%d damage)"):format(OutchDB.outch, OutchDB.outchDamage))
+        local lines = {
+            "Potion of Healing: " .. OutchDB.heal,
+            "Mana Potion: " .. OutchDB.mana,
+            "Go fast potion: " .. OutchDB.swift,
+            ("Outch: %d (%d damage)"):format(OutchDB.outch, OutchDB.outchDamage),
+        }
+
+        local channel
+        if arg == "s" then
+            channel = "SAY"
+        elseif arg == "p" then
+            if not (IsInGroup and IsInGroup() or GetNumPartyMembers and GetNumPartyMembers() > 0) then
+                Print("Outch: you are not in a party.")
+                return
+            end
+            channel = "PARTY"
+        end
+
+        for _, line in ipairs(lines) do
+            if channel then
+                SendChatMessage(line, channel)
+            else
+                Print(line)
+            end
+        end
     end
 end
