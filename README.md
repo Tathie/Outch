@@ -12,7 +12,7 @@ Each use gives one of:
 
 ## Install
 
-Copy the `Outch` folder into your client's `Interface\AddOns\` folder and `/reload`.
+Copy the `Outch` folder into `World of Warcraft\_forever_\Interface\AddOns\` and `/reload`.
 
 If the addon shows as out of date, run `/dump select(4, GetBuildInfo())` in game and
 put that number on the `## Interface:` line of `Outch.toc`, or tick "Load out of date AddOns".
