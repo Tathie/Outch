@@ -1,24 +1,44 @@
 -- Outch: tracks the outcome of using a Satchel of Potions (item 280766).
 --
--- The satchel isn't used up; it goes on a 10 minute cooldown. WoW Forever
--- runs on the modern client, where addons can't read the combat log, so:
---   * a use is detected when the satchel's cooldown starts (or when you cast
---     its spell),
---   * a potion appearing in your bags within a few seconds is that outcome,
---   * no potion means the satchel burned you (Outch); the damage is read from
---     your own health dropping.
+-- The satchel isn't used up; it goes on a 10 minute cooldown and makes you
+-- drink one of three potions on the spot (no item is created), or burns you.
+-- WoW Forever runs on the modern client, where addons can't read the combat
+-- log, so:
+--   * a use is detected when the satchel's cooldown starts (or you cast its
+--     spell),
+--   * the potion is detected from you casting its spell, with backups: the
+--     Swiftness buff appearing, or a big jump in your mana or health,
+--   * nothing within a few seconds means the satchel burned you (Outch); the
+--     damage is read from your own health dropping.
 
 local SATCHEL_ID = 280766
 
--- Item ID -> counter key
-local OUTCOME_ITEMS = {
-    [1710] = "heal",  -- Greater Healing Potion
-    [3827] = "mana",  -- Mana Potion
-    [2459] = "swift", -- Swiftness Potion
+-- Potion spell ID -> counter key
+local OUTCOME_SPELLS = {
+    [2024] = "heal",  -- Greater Healing Potion
+    [2023] = "mana",  -- Mana Potion
+    [2379] = "swift", -- Swiftness Potion
 }
 
--- Seconds between using the satchel and a potion appearing that we still
--- treat as the same use.
+-- Fallback: spell names, in case Forever uses different spell IDs.
+local OUTCOME_SPELL_NAMES = {
+    ["Healing Potion"] = "heal",
+    ["Greater Healing Potion"] = "heal",
+    ["Restore Mana"] = "mana",
+    ["Mana Potion"] = "mana",
+    ["Speed"] = "swift",
+    ["Swiftness Potion"] = "swift",
+}
+
+local SWIFTNESS_AURA = 2379
+
+-- A jump at least this big in mana/health right after using the satchel
+-- counts as the mana/healing potion when the spell itself wasn't seen.
+local MIN_MANA_GAIN = 200
+local MIN_HEALTH_GAIN = 200
+
+-- Seconds between using the satchel and the outcome that we still treat as
+-- the same use.
 local WINDOW = 5
 
 -- Damage the satchel deals; used only if your health can't be read.
@@ -28,18 +48,17 @@ local OUTCH_DAMAGE = 216
 -- 2 minute potion cooldown the satchel might share). The satchel's is 10 min.
 local MIN_COOLDOWN = 300
 
-local GetItemCountFn = (C_Item and C_Item.GetItemCount) or GetItemCount
 local GetItemCooldownFn = (C_Item and C_Item.GetItemCooldown)
     or (C_Container and C_Container.GetItemCooldown) or GetItemCooldown
 local GetItemSpellFn = (C_Item and C_Item.GetItemSpell) or GetItemSpell
 local SendChatFn = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
 
 local debugMode = false
-local counts = {}        -- last seen bag counts, by item ID
 local pendingUses = {}   -- satchel uses not resolved yet: { time }
-local recentGains = {}   -- potions that appeared recently: { key, time }
+local outcomes = {}      -- potion effects seen recently: { key, time }
 local healthLosses = {}  -- recent drops in your health: { time, amount }
-local lastHealth
+local lastHealth, lastMana
+local hadSwiftness = false
 local lastUseTime = -1000
 local lastCooldownStart
 
@@ -68,68 +87,42 @@ local function InitDB()
     OutchDB.outchDamage = OutchDB.outchDamage or 0
 end
 
-local function Count(itemID)
-    return GetItemCountFn(itemID) or 0
+local function ReadNumber(fn, ...)
+    local ok, v = pcall(fn, ...)
+    if not ok or type(v) ~= "number" or IsSecret(v) then return nil end
+    return v
 end
-
--- Potions arriving while you're at a vendor, bank, mailbox or trade window
--- are bought/moved, not from the satchel.
-local TRANSFER_FRAMES = {
-    "MerchantFrame", "BankFrame", "MailFrame", "TradeFrame",
-    "GuildBankFrame", "AuctionHouseFrame", "AuctionFrame",
-}
-local function IsBusy()
-    for _, name in ipairs(TRANSFER_FRAMES) do
-        local f = _G[name]
-        if f and f.IsShown and f:IsShown() then return true end
-    end
-    return false
-end
-
--- Turn a GlobalStrings format like "You create: %s." into a Lua pattern.
-local function FormatToPattern(fmt)
-    local p = fmt:gsub("([%(%)%.%[%]%*%+%-%?%^%$])", "%%%1")
-    p = p:gsub("%%%%s", "(.+)")
-    p = p:gsub("%%%%d", "(%%d+)")
-    return "^" .. p .. "$"
-end
-
-local SELF_LOOT_PATTERNS = {}
-for _, key in ipairs({
-    "LOOT_ITEM_CREATED_SELF", "LOOT_ITEM_CREATED_SELF_MULTIPLE",
-    "LOOT_ITEM_PUSHED_SELF", "LOOT_ITEM_PUSHED_SELF_MULTIPLE",
-    "LOOT_ITEM_SELF", "LOOT_ITEM_SELF_MULTIPLE",
-}) do
-    if type(_G[key]) == "string" then
-        table.insert(SELF_LOOT_PATTERNS, FormatToPattern(_G[key]))
-    end
-end
-
-local function IsSelfLoot(msg)
-    for _, pattern in ipairs(SELF_LOOT_PATTERNS) do
-        if msg:match(pattern) then return true end
-    end
-    return false
-end
-
----------------------------------------------------------------------------
--- Health tracking (for Outch damage)
----------------------------------------------------------------------------
 
 local function ReadHealth()
-    local ok, h = pcall(UnitHealth, "player")
-    if not ok or type(h) ~= "number" or IsSecret(h) then return nil end
-    return h
+    return ReadNumber(UnitHealth, "player")
 end
 
-local function OnHealthChanged()
-    local h = ReadHealth()
-    if h and lastHealth and h < lastHealth then
-        table.insert(healthLosses, { time = GetTime(), amount = lastHealth - h })
-        Debug("Health -" .. (lastHealth - h))
-    end
-    lastHealth = h
+local function ReadMana()
+    local manaType = (Enum and Enum.PowerType and Enum.PowerType.Mana) or 0
+    return ReadNumber(UnitPower, "player", manaType)
 end
+
+local function HasSwiftness()
+    if C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID then
+        local ok, aura = pcall(C_UnitAuras.GetPlayerAuraBySpellID, SWIFTNESS_AURA)
+        return ok and aura ~= nil
+    end
+    return false
+end
+
+local function SpellName(spellID)
+    if IsSecret(spellID) then return nil end
+    if C_Spell and C_Spell.GetSpellName then
+        local ok, name = pcall(C_Spell.GetSpellName, spellID)
+        if ok then return name end
+    elseif GetSpellInfo then
+        return (GetSpellInfo(spellID))
+    end
+end
+
+---------------------------------------------------------------------------
+-- Matching satchel uses to outcomes
+---------------------------------------------------------------------------
 
 -- Largest single health drop around the time the satchel was used.
 local function DamageNear(t)
@@ -142,38 +135,23 @@ local function DamageNear(t)
     return best
 end
 
----------------------------------------------------------------------------
--- Matching satchel uses to outcomes
----------------------------------------------------------------------------
-
 local function Resolve()
     local now = GetTime()
-
-    -- The bag scan and the loot message can both report the same potion;
-    -- keep only one per kind within the window.
-    for j = #recentGains, 2, -1 do
-        for k = 1, j - 1 do
-            local a, b = recentGains[j], recentGains[k]
-            if a.key == b.key and math.abs(a.time - b.time) <= WINDOW then
-                table.remove(recentGains, j)
-                break
-            end
-        end
-    end
 
     local i = 1
     while i <= #pendingUses do
         local use = pendingUses[i]
         local matched
-        for j, gain in ipairs(recentGains) do
-            if math.abs(gain.time - use.time) <= WINDOW then
+        for j, outcome in ipairs(outcomes) do
+            if math.abs(outcome.time - use.time) <= WINDOW then
                 matched = j
                 break
             end
         end
 
         if matched then
-            local key = table.remove(recentGains, matched).key
+            local key = outcomes[matched].key
+            wipe(outcomes) -- one outcome per use; drop duplicate signals
             OutchDB[key] = OutchDB[key] + 1
             table.remove(pendingUses, i)
             Debug("Counted " .. key)
@@ -189,15 +167,28 @@ local function Resolve()
         end
     end
 
-    for j = #recentGains, 1, -1 do
-        if now - recentGains[j].time > WINDOW then table.remove(recentGains, j) end
+    for j = #outcomes, 1, -1 do
+        if now - outcomes[j].time > WINDOW then table.remove(outcomes, j) end
     end
     for j = #healthLosses, 1, -1 do
         if now - healthLosses[j].time > WINDOW * 3 then table.remove(healthLosses, j) end
     end
 end
 
--- Called by every detection path; the satchel's 10 minute cooldown means
+local function AddOutcome(key, how)
+    -- Ignore effects nowhere near a satchel use (e.g. drinking a real potion).
+    local now = GetTime()
+    if now - lastUseTime > WINDOW and #pendingUses == 0 then
+        -- Might still arrive just before the cooldown event; keep it briefly.
+        Debug(key .. " seen (" .. how .. "), waiting for a satchel use")
+    else
+        Debug(key .. " seen (" .. how .. ")")
+    end
+    table.insert(outcomes, { key = key, time = now })
+    Resolve()
+end
+
+-- Called by every use-detection path; the satchel's 10 minute cooldown means
 -- anything within a few seconds of the last use is the same use.
 local function MarkUse(how)
     local now = GetTime()
@@ -207,6 +198,10 @@ local function MarkUse(how)
     Debug("Satchel used (" .. how .. ")")
     C_Timer.After(WINDOW + 0.2, Resolve)
     Resolve()
+end
+
+local function NearUse()
+    return #pendingUses > 0 or GetTime() - lastUseTime <= WINDOW
 end
 
 ---------------------------------------------------------------------------
@@ -241,34 +236,55 @@ local function SatchelSpellID()
 end
 
 ---------------------------------------------------------------------------
--- Watching bags for potions
+-- Watching for outcomes
 ---------------------------------------------------------------------------
 
-local function ScanBags()
-    local now = GetTime()
-    local busy = IsBusy()
+local function OnSpellCast(spellID)
+    if IsSecret(spellID) then
+        Debug("You cast a spell (hidden by the game)")
+        return
+    end
+    local name = SpellName(spellID)
+    Debug("You cast: " .. tostring(name) .. " (spell " .. tostring(spellID) .. ")")
 
-    for itemID, key in pairs(OUTCOME_ITEMS) do
-        local c = Count(itemID)
-        local before = counts[itemID]
-        if before and c > before then
-            if busy then
-                Debug(key .. " +" .. (c - before) .. " ignored (vendor/bank/mail open)")
-            else
-                table.insert(recentGains, { key = key, time = now })
-                Debug(key .. " +" .. (c - before))
-            end
-        end
-        counts[itemID] = c
+    local satchelSpell = SatchelSpellID()
+    if satchelSpell and spellID == satchelSpell then
+        MarkUse("spell cast")
     end
 
-    Resolve()
+    local key = OUTCOME_SPELLS[spellID] or (name and OUTCOME_SPELL_NAMES[name])
+    if key then AddOutcome(key, "spell " .. tostring(name)) end
 end
 
-local function SnapshotBags()
-    for itemID in pairs(OUTCOME_ITEMS) do
-        counts[itemID] = Count(itemID)
+local function OnHealthChanged()
+    local h = ReadHealth()
+    if h and lastHealth then
+        if h < lastHealth then
+            table.insert(healthLosses, { time = GetTime(), amount = lastHealth - h })
+            Debug("Health -" .. (lastHealth - h))
+        elseif h - lastHealth >= MIN_HEALTH_GAIN and NearUse() then
+            Debug("Health +" .. (h - lastHealth))
+            AddOutcome("heal", "health jump")
+        end
     end
+    lastHealth = h
+end
+
+local function OnManaChanged()
+    local m = ReadMana()
+    if m and lastMana and m - lastMana >= MIN_MANA_GAIN and NearUse() then
+        Debug("Mana +" .. (m - lastMana))
+        AddOutcome("mana", "mana jump")
+    end
+    lastMana = m
+end
+
+local function OnAuraChanged()
+    local has = HasSwiftness()
+    if has and not hadSwiftness then
+        AddOutcome("swift", "speed buff")
+    end
+    hadSwiftness = has
 end
 
 ---------------------------------------------------------------------------
@@ -283,12 +299,12 @@ end
 
 SafeRegister("ADDON_LOADED")
 SafeRegister("PLAYER_ENTERING_WORLD")
-SafeRegister("BAG_UPDATE_DELAYED")
 SafeRegister("BAG_UPDATE_COOLDOWN")
 SafeRegister("SPELL_UPDATE_COOLDOWN")
-SafeRegister("CHAT_MSG_LOOT")
-pcall(frame.RegisterUnitEvent, frame, "UNIT_HEALTH", "player")
 pcall(frame.RegisterUnitEvent, frame, "UNIT_SPELLCAST_SUCCEEDED", "player")
+pcall(frame.RegisterUnitEvent, frame, "UNIT_HEALTH", "player")
+pcall(frame.RegisterUnitEvent, frame, "UNIT_POWER_UPDATE", "player")
+pcall(frame.RegisterUnitEvent, frame, "UNIT_AURA", "player")
 
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -296,42 +312,29 @@ frame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "PLAYER_ENTERING_WORLD" then
         lastHealth = ReadHealth()
-        SnapshotBags()
+        lastMana = ReadMana()
+        hadSwiftness = HasSwiftness()
         -- Don't count a cooldown that was already running when you logged in.
         local start, duration = ReadCooldown()
         if start and start > 0 and duration >= MIN_COOLDOWN then
             lastCooldownStart = start
         end
 
-    elseif event == "BAG_UPDATE_DELAYED" then
-        ScanBags()
-
     elseif event == "BAG_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_COOLDOWN" then
         CheckCooldown()
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _, _, spellID = ...
-        if IsSecret(spellID) then return end
-        local satchelSpell = SatchelSpellID()
-        if satchelSpell and spellID == satchelSpell then
-            MarkUse("spell cast")
-        end
+        OnSpellCast(spellID)
 
     elseif event == "UNIT_HEALTH" then
         OnHealthChanged()
 
-    elseif event == "CHAT_MSG_LOOT" then
-        local msg = ...
-        if type(msg) ~= "string" or IsSecret(msg) then return end
-        local itemID = tonumber(msg:match("item:(%d+)"))
-        local key = itemID and OUTCOME_ITEMS[itemID]
-        if key then
-            Debug("Loot message: " .. msg)
-            if IsSelfLoot(msg) and not IsBusy() then
-                table.insert(recentGains, { key = key, time = GetTime() })
-                Resolve()
-            end
-        end
+    elseif event == "UNIT_POWER_UPDATE" then
+        OnManaChanged()
+
+    elseif event == "UNIT_AURA" then
+        OnAuraChanged()
     end
 end)
 
@@ -350,10 +353,11 @@ SlashCmdList["OUTCH"] = function(arg)
         debugMode = not debugMode
         Print("Outch: debug " .. (debugMode and "on" or "off") .. ".")
         if debugMode then
-            local start, duration = ReadCooldown()
+            local start = ReadCooldown()
             Debug("Satchel cooldown readable: " .. (start and "yes" or "no")
                 .. ", satchel spell: " .. tostring(SatchelSpellID())
-                .. ", health readable: " .. (ReadHealth() and "yes" or "no"))
+                .. ", health readable: " .. (ReadHealth() and "yes" or "no")
+                .. ", mana readable: " .. (ReadMana() and "yes" or "no"))
         end
     else
         local lines = {

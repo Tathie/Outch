@@ -38,12 +38,12 @@ Counts are saved between sessions and shared across all characters on the accoun
 ## How it works
 
 WoW Forever runs on the modern client, where addons can't read the combat log.
-The satchel isn't used up; it goes on a 10 minute cooldown. Outch notices that
-cooldown starting (or you casting the satchel's spell), then looks for one of the
-three potions appearing in your bags (or a "You create/receive" loot message for one)
-within 5 seconds. If none does, it counts an
-Outch and reads the damage from your own health dropping (falling back to 216 if your
-health can't be read at that moment).
+The satchel isn't used up; it goes on a 10 minute cooldown, and it makes you drink
+the potion on the spot rather than giving you one.
 
-Potions that arrive while a vendor, bank, mailbox, auction house or trade window is
-open are ignored.
+Outch notices the satchel's cooldown starting (or you casting its spell), then
+looks for the potion's effect within 5 seconds: you casting the potion's spell, or
+as a backup the Swiftness speed buff appearing or a big jump (200+) in your mana or
+health. If none of those happens, it counts an Outch and reads the damage from your
+own health dropping (falling back to 216 if your health can't be read at that
+moment).
