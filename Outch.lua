@@ -1,10 +1,12 @@
 -- Outch: tracks the outcome of using a Satchel of Potions (item 280766).
 --
--- WoW Forever runs on the modern client, where addons can't read the combat
--- log. So instead of watching spells, Outch watches your bags: when a satchel
--- disappears, it looks for one of the three potions appearing around the same
--- time. If none shows up, the satchel burned you (Outch), and the damage is
--- read from your own health dropping.
+-- The satchel isn't used up; it goes on a 10 minute cooldown. WoW Forever
+-- runs on the modern client, where addons can't read the combat log, so:
+--   * a use is detected when the satchel's cooldown starts (or when you cast
+--     its spell),
+--   * a potion appearing in your bags within a few seconds is that outcome,
+--   * no potion means the satchel burned you (Outch); the damage is read from
+--     your own health dropping.
 
 local SATCHEL_ID = 280766
 
@@ -15,22 +17,31 @@ local OUTCOME_ITEMS = {
     [2459] = "swift", -- Swiftness Potion
 }
 
--- Seconds between a satchel disappearing and a potion appearing that we still
--- treat as the same opening.
+-- Seconds between using the satchel and a potion appearing that we still
+-- treat as the same use.
 local WINDOW = 3
 
 -- Damage the satchel deals; used only if your health can't be read.
 local OUTCH_DAMAGE = 216
 
+-- Cooldowns shorter than this aren't a satchel use (global cooldown, or a
+-- 2 minute potion cooldown the satchel might share). The satchel's is 10 min.
+local MIN_COOLDOWN = 300
+
 local GetItemCountFn = (C_Item and C_Item.GetItemCount) or GetItemCount
+local GetItemCooldownFn = (C_Item and C_Item.GetItemCooldown)
+    or (C_Container and C_Container.GetItemCooldown) or GetItemCooldown
+local GetItemSpellFn = (C_Item and C_Item.GetItemSpell) or GetItemSpell
 local SendChatFn = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
 
 local debugMode = false
 local counts = {}        -- last seen bag counts, by item ID
-local pendingUses = {}   -- satchels that vanished and aren't resolved yet: { time }
+local pendingUses = {}   -- satchel uses not resolved yet: { time }
 local recentGains = {}   -- potions that appeared recently: { key, time }
 local healthLosses = {}  -- recent drops in your health: { time, amount }
 local lastHealth
+local lastUseTime = -1000
+local lastCooldownStart
 local openFrames = {}    -- vendor/bank/mail/trade etc. currently open
 
 ---------------------------------------------------------------------------
@@ -43,6 +54,10 @@ end
 
 local function Debug(msg)
     if debugMode then Print("|cff888888[Outch debug]|r " .. msg) end
+end
+
+local function IsSecret(v)
+    return issecretvalue and issecretvalue(v) or false
 end
 
 local function InitDB()
@@ -58,8 +73,8 @@ local function Count(itemID)
     return GetItemCountFn(itemID) or 0
 end
 
--- Satchels leaving your bags at a vendor, bank, mailbox or trade window
--- weren't opened, so ignore bag changes while one of those is open.
+-- Potions arriving while you're at a vendor, bank, mailbox or trade window
+-- are bought/moved, not from the satchel.
 local function IsBusy()
     return next(openFrames) ~= nil
 end
@@ -70,8 +85,7 @@ end
 
 local function ReadHealth()
     local ok, h = pcall(UnitHealth, "player")
-    if not ok or type(h) ~= "number" then return nil end
-    if issecretvalue and issecretvalue(h) then return nil end
+    if not ok or type(h) ~= "number" or IsSecret(h) then return nil end
     return h
 end
 
@@ -79,6 +93,7 @@ local function OnHealthChanged()
     local h = ReadHealth()
     if h and lastHealth and h < lastHealth then
         table.insert(healthLosses, { time = GetTime(), amount = lastHealth - h })
+        Debug("Health -" .. (lastHealth - h))
     end
     lastHealth = h
 end
@@ -137,6 +152,53 @@ local function Resolve()
     end
 end
 
+-- Called by every detection path; the satchel's 10 minute cooldown means
+-- anything within a few seconds of the last use is the same use.
+local function MarkUse(how)
+    local now = GetTime()
+    if now - lastUseTime < 10 then return end
+    lastUseTime = now
+    table.insert(pendingUses, { time = now })
+    Debug("Satchel used (" .. how .. ")")
+    C_Timer.After(WINDOW + 0.2, Resolve)
+    Resolve()
+end
+
+---------------------------------------------------------------------------
+-- Detecting a use
+---------------------------------------------------------------------------
+
+local function ReadCooldown()
+    if not GetItemCooldownFn then return nil end
+    local ok, start, duration = pcall(GetItemCooldownFn, SATCHEL_ID)
+    if not ok or type(start) ~= "number" or type(duration) ~= "number" then return nil end
+    if IsSecret(start) or IsSecret(duration) then return nil end
+    return start, duration
+end
+
+local function CheckCooldown()
+    local start, duration = ReadCooldown()
+    if not start then return end
+    if start > 0 and duration >= MIN_COOLDOWN then
+        if lastCooldownStart ~= start then
+            lastCooldownStart = start
+            MarkUse("cooldown started")
+        end
+    else
+        lastCooldownStart = nil
+    end
+end
+
+local function SatchelSpellID()
+    if not GetItemSpellFn then return nil end
+    local ok, _, spellID = pcall(GetItemSpellFn, SATCHEL_ID)
+    if ok then return spellID end
+end
+
+---------------------------------------------------------------------------
+-- Watching bags for potions
+---------------------------------------------------------------------------
+
 local function ScanBags()
     local now = GetTime()
     local busy = IsBusy()
@@ -155,26 +217,10 @@ local function ScanBags()
         counts[itemID] = c
     end
 
-    local s = Count(SATCHEL_ID)
-    local before = counts[SATCHEL_ID]
-    if before and s < before then
-        if busy then
-            Debug("Satchel -" .. (before - s) .. " ignored (vendor/bank/mail open)")
-        else
-            Debug("Satchel used (" .. before .. " -> " .. s .. ")")
-            for _ = 1, before - s do
-                table.insert(pendingUses, { time = now })
-            end
-            C_Timer.After(WINDOW + 0.2, Resolve)
-        end
-    end
-    counts[SATCHEL_ID] = s
-
     Resolve()
 end
 
 local function SnapshotBags()
-    counts[SATCHEL_ID] = Count(SATCHEL_ID)
     for itemID in pairs(OUTCOME_ITEMS) do
         counts[itemID] = Count(itemID)
     end
@@ -193,9 +239,12 @@ end
 SafeRegister("ADDON_LOADED")
 SafeRegister("PLAYER_ENTERING_WORLD")
 SafeRegister("BAG_UPDATE_DELAYED")
+SafeRegister("BAG_UPDATE_COOLDOWN")
+SafeRegister("SPELL_UPDATE_COOLDOWN")
 SafeRegister("PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
 SafeRegister("PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
 pcall(frame.RegisterUnitEvent, frame, "UNIT_HEALTH", "player")
+pcall(frame.RegisterUnitEvent, frame, "UNIT_SPELLCAST_SUCCEEDED", "player")
 
 -- Older-style open/close events, in case the interaction manager misses any.
 local CLASSIC_FRAME_EVENTS = {
@@ -207,7 +256,13 @@ local CLASSIC_FRAME_EVENTS = {
     AUCTION_HOUSE_SHOW = "auction", AUCTION_HOUSE_CLOSED = "auction",
 }
 for event in pairs(CLASSIC_FRAME_EVENTS) do SafeRegister(event) end
--- Interaction windows where items can leave your bags without being used.
+
+local OPEN_EVENTS = {
+    MERCHANT_SHOW = true, BANKFRAME_OPENED = true, MAIL_SHOW = true,
+    TRADE_SHOW = true, GUILDBANKFRAME_OPENED = true, AUCTION_HOUSE_SHOW = true,
+}
+
+-- Interaction windows where potions can arrive without the satchel.
 local TRANSFER_INTERACTIONS = {}
 if Enum and Enum.PlayerInteractionType then
     for _, name in ipairs({
@@ -219,11 +274,6 @@ if Enum and Enum.PlayerInteractionType then
     end
 end
 
-local OPEN_EVENTS = {
-    MERCHANT_SHOW = true, BANKFRAME_OPENED = true, MAIL_SHOW = true,
-    TRADE_SHOW = true, GUILDBANKFRAME_OPENED = true, AUCTION_HOUSE_SHOW = true,
-}
-
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
         if ... == "Outch" then InitDB() end
@@ -232,9 +282,25 @@ frame:SetScript("OnEvent", function(self, event, ...)
         wipe(openFrames)
         lastHealth = ReadHealth()
         SnapshotBags()
+        -- Don't count a cooldown that was already running when you logged in.
+        local start, duration = ReadCooldown()
+        if start and start > 0 and duration >= MIN_COOLDOWN then
+            lastCooldownStart = start
+        end
 
     elseif event == "BAG_UPDATE_DELAYED" then
         ScanBags()
+
+    elseif event == "BAG_UPDATE_COOLDOWN" or event == "SPELL_UPDATE_COOLDOWN" then
+        CheckCooldown()
+
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+        local _, _, spellID = ...
+        if IsSecret(spellID) then return end
+        local satchelSpell = SatchelSpellID()
+        if satchelSpell and spellID == satchelSpell then
+            MarkUse("spell cast")
+        end
 
     elseif event == "UNIT_HEALTH" then
         OnHealthChanged()
@@ -265,6 +331,12 @@ SlashCmdList["OUTCH"] = function(arg)
     elseif arg == "debug" then
         debugMode = not debugMode
         Print("Outch: debug " .. (debugMode and "on" or "off") .. ".")
+        if debugMode then
+            local start, duration = ReadCooldown()
+            Debug("Satchel cooldown readable: " .. (start and "yes" or "no")
+                .. ", satchel spell: " .. tostring(SatchelSpellID())
+                .. ", health readable: " .. (ReadHealth() and "yes" or "no"))
+        end
     else
         local lines = {
             "Potion of Healing: " .. OutchDB.heal,
