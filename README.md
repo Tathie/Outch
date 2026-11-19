@@ -34,3 +34,14 @@ put that number on the `## Interface:` line of `Outch.toc`, or tick "Load out of
 - `/outch debug` toggles debug messages showing what the addon sees after each use.
 
 Counts are saved between sessions and shared across all characters on the account.
+
+## How it works
+
+WoW Forever runs on the modern client, where addons can't read the combat log.
+Outch watches your bags instead: when a Satchel of Potions disappears, it looks for
+one of the three potions appearing within 3 seconds. If none does, it counts an Outch
+and reads the damage from your own health dropping (falling back to 216 if your
+health can't be read at that moment).
+
+Satchels that leave your bags while a vendor, bank, mailbox, auction house or trade
+window is open are ignored. Destroying a satchel elsewhere would count as an Outch.

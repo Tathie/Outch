@@ -1,4 +1,10 @@
 -- Outch: tracks the outcome of using a Satchel of Potions (item 280766).
+--
+-- WoW Forever runs on the modern client, where addons can't read the combat
+-- log. So instead of watching spells, Outch watches your bags: when a satchel
+-- disappears, it looks for one of the three potions appearing around the same
+-- time. If none shows up, the satchel burned you (Outch), and the damage is
+-- read from your own health dropping.
 
 local SATCHEL_ID = 280766
 
@@ -9,12 +15,23 @@ local OUTCOME_ITEMS = {
     [2459] = "swift", -- Swiftness Potion
 }
 
--- How long after using the satchel we will attribute a result to it (seconds).
+-- Seconds between a satchel disappearing and a potion appearing that we still
+-- treat as the same opening.
 local WINDOW = 3
 
-local pendingUntil = 0
+-- Damage the satchel deals; used only if your health can't be read.
+local OUTCH_DAMAGE = 216
+
+local GetItemCountFn = (C_Item and C_Item.GetItemCount) or GetItemCount
+local SendChatFn = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
+
 local debugMode = false
-local playerGUID
+local counts = {}        -- last seen bag counts, by item ID
+local pendingUses = {}   -- satchels that vanished and aren't resolved yet: { time }
+local recentGains = {}   -- potions that appeared recently: { key, time }
+local healthLosses = {}  -- recent drops in your health: { time, amount }
+local lastHealth
+local openFrames = {}    -- vendor/bank/mail/trade etc. currently open
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -37,89 +54,130 @@ local function InitDB()
     OutchDB.outchDamage = OutchDB.outchDamage or 0
 end
 
-local function MarkUse(source)
-    pendingUntil = GetTime() + WINDOW
-    Debug("Satchel used (" .. source .. ")")
+local function Count(itemID)
+    return GetItemCountFn(itemID) or 0
 end
 
-local function IsPending()
-    return GetTime() <= pendingUntil
-end
-
-local function ClearPending()
-    pendingUntil = 0
-end
-
-local GetItemSpellFn = (C_Item and C_Item.GetItemSpell) or GetItemSpell
-local function GetSatchelSpell()
-    if GetItemSpellFn then
-        return GetItemSpellFn(SATCHEL_ID) -- name, spellID (may be nil until item is cached)
-    end
-end
-
-local function ItemIDFromLink(link)
-    return link and tonumber(link:match("item:(%d+)"))
-end
-
--- Turn a GlobalStrings format like "You receive item: %s." into a Lua pattern.
-local function FormatToPattern(fmt)
-    local p = fmt:gsub("([%(%)%.%[%]%*%+%-%?%^%$])", "%%%1")
-    p = p:gsub("%%%%s", "(.+)")
-    p = p:gsub("%%%%d", "(%%d+)")
-    return "^" .. p .. "$"
-end
-
-local SELF_LOOT_PATTERNS = {}
-for _, key in ipairs({
-    "LOOT_ITEM_CREATED_SELF", "LOOT_ITEM_CREATED_SELF_MULTIPLE",
-    "LOOT_ITEM_PUSHED_SELF", "LOOT_ITEM_PUSHED_SELF_MULTIPLE",
-    "LOOT_ITEM_SELF", "LOOT_ITEM_SELF_MULTIPLE",
-}) do
-    if _G[key] then table.insert(SELF_LOOT_PATTERNS, FormatToPattern(_G[key])) end
-end
-
-local function IsSelfLoot(msg)
-    for _, pattern in ipairs(SELF_LOOT_PATTERNS) do
-        if msg:match(pattern) then return true end
-    end
-    return false
+-- Satchels leaving your bags at a vendor, bank, mailbox or trade window
+-- weren't opened, so ignore bag changes while one of those is open.
+local function IsBusy()
+    return next(openFrames) ~= nil
 end
 
 ---------------------------------------------------------------------------
--- Detect satchel use (several paths, any one is enough)
+-- Health tracking (for Outch damage)
 ---------------------------------------------------------------------------
 
-local function GetContainerItemIDSafe(bag, slot)
-    if C_Container and C_Container.GetContainerItemID then
-        return C_Container.GetContainerItemID(bag, slot)
-    elseif GetContainerItemID then
-        return GetContainerItemID(bag, slot)
+local function ReadHealth()
+    local ok, h = pcall(UnitHealth, "player")
+    if not ok or type(h) ~= "number" then return nil end
+    if issecretvalue and issecretvalue(h) then return nil end
+    return h
+end
+
+local function OnHealthChanged()
+    local h = ReadHealth()
+    if h and lastHealth and h < lastHealth then
+        table.insert(healthLosses, { time = GetTime(), amount = lastHealth - h })
+    end
+    lastHealth = h
+end
+
+-- Largest single health drop around the time the satchel was used.
+local function DamageNear(t)
+    local best
+    for _, loss in ipairs(healthLosses) do
+        if loss.time >= t - 1.5 and loss.time <= t + WINDOW then
+            if not best or loss.amount > best then best = loss.amount end
+        end
+    end
+    return best
+end
+
+---------------------------------------------------------------------------
+-- Matching satchel uses to outcomes
+---------------------------------------------------------------------------
+
+local function Resolve()
+    local now = GetTime()
+
+    local i = 1
+    while i <= #pendingUses do
+        local use = pendingUses[i]
+        local matched
+        for j, gain in ipairs(recentGains) do
+            if math.abs(gain.time - use.time) <= WINDOW then
+                matched = j
+                break
+            end
+        end
+
+        if matched then
+            local key = table.remove(recentGains, matched).key
+            OutchDB[key] = OutchDB[key] + 1
+            table.remove(pendingUses, i)
+            Debug("Counted " .. key)
+        elseif now - use.time > WINDOW then
+            local damage = DamageNear(use.time)
+            OutchDB.outch = OutchDB.outch + 1
+            OutchDB.outchDamage = OutchDB.outchDamage + (damage or OUTCH_DAMAGE)
+            table.remove(pendingUses, i)
+            Debug("Counted Outch for " .. (damage or OUTCH_DAMAGE)
+                .. (damage and "" or " (health unreadable, assumed)"))
+        else
+            i = i + 1
+        end
+    end
+
+    for j = #recentGains, 1, -1 do
+        if now - recentGains[j].time > WINDOW then table.remove(recentGains, j) end
+    end
+    for j = #healthLosses, 1, -1 do
+        if now - healthLosses[j].time > WINDOW * 3 then table.remove(healthLosses, j) end
     end
 end
 
-local function OnUseContainerItem(bag, slot)
-    if GetContainerItemIDSafe(bag, slot) == SATCHEL_ID then MarkUse("bag") end
+local function ScanBags()
+    local now = GetTime()
+    local busy = IsBusy()
+
+    for itemID, key in pairs(OUTCOME_ITEMS) do
+        local c = Count(itemID)
+        local before = counts[itemID]
+        if before and c > before then
+            if busy then
+                Debug(key .. " +" .. (c - before) .. " ignored (vendor/bank/mail open)")
+            else
+                table.insert(recentGains, { key = key, time = now })
+                Debug(key .. " +" .. (c - before))
+            end
+        end
+        counts[itemID] = c
+    end
+
+    local s = Count(SATCHEL_ID)
+    local before = counts[SATCHEL_ID]
+    if before and s < before then
+        if busy then
+            Debug("Satchel -" .. (before - s) .. " ignored (vendor/bank/mail open)")
+        else
+            Debug("Satchel used (" .. before .. " -> " .. s .. ")")
+            for _ = 1, before - s do
+                table.insert(pendingUses, { time = now })
+            end
+            C_Timer.After(WINDOW + 0.2, Resolve)
+        end
+    end
+    counts[SATCHEL_ID] = s
+
+    Resolve()
 end
 
-if C_Container and C_Container.UseContainerItem then
-    hooksecurefunc(C_Container, "UseContainerItem", OnUseContainerItem)
-end
-if UseContainerItem then
-    hooksecurefunc("UseContainerItem", OnUseContainerItem)
-end
-
-if UseAction then
-    hooksecurefunc("UseAction", function(slot)
-        local actionType, id = GetActionInfo(slot)
-        if actionType == "item" and id == SATCHEL_ID then MarkUse("action bar") end
-    end)
-end
-
-if UseItemByName then
-    hooksecurefunc("UseItemByName", function(name)
-        local _, link = GetItemInfo(name)
-        if ItemIDFromLink(link) == SATCHEL_ID then MarkUse("macro") end
-    end)
+local function SnapshotBags()
+    counts[SATCHEL_ID] = Count(SATCHEL_ID)
+    for itemID in pairs(OUTCOME_ITEMS) do
+        counts[itemID] = Count(itemID)
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -127,71 +185,69 @@ end
 ---------------------------------------------------------------------------
 
 local frame = CreateFrame("Frame")
-frame:RegisterEvent("ADDON_LOADED")
-frame:RegisterEvent("PLAYER_LOGIN")
-frame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
-frame:RegisterEvent("CHAT_MSG_LOOT")
-frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 
-local function RecordOutch(amount, how)
-    OutchDB.outch = OutchDB.outch + 1
-    OutchDB.outchDamage = OutchDB.outchDamage + (amount or 0)
-    ClearPending()
-    Debug("Counted Outch for " .. tostring(amount) .. " (" .. how .. ")")
+local function SafeRegister(event)
+    pcall(frame.RegisterEvent, frame, event)
 end
 
-local function OnCombatLog()
-    if not IsPending() then return end
-    local _, subevent, _, sourceGUID, _, _, _, destGUID, _, _, _, a12, a13, a14, a15 =
-        CombatLogGetCurrentEventInfo()
-    if destGUID ~= playerGUID then return end
+SafeRegister("ADDON_LOADED")
+SafeRegister("PLAYER_ENTERING_WORLD")
+SafeRegister("BAG_UPDATE_DELAYED")
+SafeRegister("PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+SafeRegister("PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
+pcall(frame.RegisterUnitEvent, frame, "UNIT_HEALTH", "player")
 
-    if subevent == "SPELL_DAMAGE" or subevent == "RANGE_DAMAGE" then
-        -- a12 = spellID, a13 = spellName, a14 = spellSchool, a15 = amount
-        local satchelSpellName = GetSatchelSpell()
-        local isFire = bit.band(a14 or 0, 0x4) ~= 0
-        Debug(("Self damage: %s %s school=%s amount=%s"):format(subevent, tostring(a13), tostring(a14), tostring(a15)))
-        if sourceGUID == playerGUID or (isFire and a13 == satchelSpellName) then
-            RecordOutch(a15, a13 or subevent)
-        end
-    elseif subevent == "ENVIRONMENTAL_DAMAGE" then
-        -- a12 = environmentalType, a13 = amount
-        Debug(("Environmental damage: %s amount=%s"):format(tostring(a12), tostring(a13)))
-        if type(a12) == "string" and a12:upper() == "FIRE" then
-            RecordOutch(a13, "environmental fire")
-        end
+-- Older-style open/close events, in case the interaction manager misses any.
+local CLASSIC_FRAME_EVENTS = {
+    MERCHANT_SHOW = "merchant", MERCHANT_CLOSED = "merchant",
+    BANKFRAME_OPENED = "bank", BANKFRAME_CLOSED = "bank",
+    MAIL_SHOW = "mail", MAIL_CLOSED = "mail",
+    TRADE_SHOW = "trade", TRADE_CLOSED = "trade",
+    GUILDBANKFRAME_OPENED = "guildbank", GUILDBANKFRAME_CLOSED = "guildbank",
+    AUCTION_HOUSE_SHOW = "auction", AUCTION_HOUSE_CLOSED = "auction",
+}
+for event in pairs(CLASSIC_FRAME_EVENTS) do SafeRegister(event) end
+-- Interaction windows where items can leave your bags without being used.
+local TRANSFER_INTERACTIONS = {}
+if Enum and Enum.PlayerInteractionType then
+    for _, name in ipairs({
+        "TradePartner", "Merchant", "Banker", "MailInfo", "GuildBanker",
+        "Auctioneer", "AccountBanker", "CharacterBanker", "VoidStorageBanker",
+    }) do
+        local value = Enum.PlayerInteractionType[name]
+        if value ~= nil then TRANSFER_INTERACTIONS[value] = true end
     end
 end
+
+local OPEN_EVENTS = {
+    MERCHANT_SHOW = true, BANKFRAME_OPENED = true, MAIL_SHOW = true,
+    TRADE_SHOW = true, GUILDBANKFRAME_OPENED = true, AUCTION_HOUSE_SHOW = true,
+}
 
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
         if ... == "Outch" then InitDB() end
 
-    elseif event == "PLAYER_LOGIN" then
-        playerGUID = UnitGUID("player")
-        GetSatchelSpell() -- warm the item cache
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        wipe(openFrames)
+        lastHealth = ReadHealth()
+        SnapshotBags()
 
-    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
-        local unit, _, spellID = ...
-        if unit == "player" then
-            local _, satchelSpellID = GetSatchelSpell()
-            if satchelSpellID and spellID == satchelSpellID then MarkUse("spellcast") end
-        end
+    elseif event == "BAG_UPDATE_DELAYED" then
+        ScanBags()
 
-    elseif event == "CHAT_MSG_LOOT" then
-        if not IsPending() then return end
-        local msg = ...
-        local itemID = ItemIDFromLink(msg)
-        Debug("Loot message: " .. msg)
-        local key = itemID and OUTCOME_ITEMS[itemID]
-        if key and IsSelfLoot(msg) then
-            OutchDB[key] = OutchDB[key] + 1
-            ClearPending()
-            Debug("Counted " .. key)
-        end
+    elseif event == "UNIT_HEALTH" then
+        OnHealthChanged()
 
-    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-        OnCombatLog()
+    elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" then
+        local kind = ...
+        if TRANSFER_INTERACTIONS[kind] then openFrames["pim" .. kind] = true end
+    elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
+        local kind = ...
+        if kind ~= nil then openFrames["pim" .. tostring(kind)] = nil end
+
+    elseif CLASSIC_FRAME_EVENTS[event] then
+        openFrames[CLASSIC_FRAME_EVENTS[event]] = OPEN_EVENTS[event] or nil
     end
 end)
 
@@ -221,7 +277,7 @@ SlashCmdList["OUTCH"] = function(arg)
         if arg == "s" then
             channel = "SAY"
         elseif arg == "p" then
-            if not (IsInGroup and IsInGroup() or GetNumPartyMembers and GetNumPartyMembers() > 0) then
+            if not IsInGroup() then
                 Print("Outch: you are not in a party.")
                 return
             end
@@ -230,7 +286,7 @@ SlashCmdList["OUTCH"] = function(arg)
 
         for _, line in ipairs(lines) do
             if channel then
-                SendChatMessage(line, channel)
+                SendChatFn(line, channel)
             else
                 Print(line)
             end
