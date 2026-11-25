@@ -1,9 +1,8 @@
 -- Outch: tracks the outcome of using a Satchel of Potions (item 280766).
 --
 -- The satchel isn't used up; it goes on a 10 minute cooldown and makes you
--- drink one of three potions on the spot (no item is created), or burns you.
--- WoW Forever runs on the modern client, where addons can't read the combat
--- log, so:
+-- drink one of three potions on the spot, or burns you. WoW Forever runs on
+-- the modern client, where addons can't read the combat log, so:
 --   * a use is detected when the satchel's cooldown starts (or you cast its
 --     spell),
 --   * the potion is detected from you casting its spell, with backups: the
@@ -20,7 +19,7 @@ local OUTCOME_SPELLS = {
     [2379] = "swift", -- Swiftness Potion
 }
 
--- Fallback: spell names, in case Forever uses different spell IDs.
+-- Spell names as a fallback, in case Forever uses different spell IDs.
 local OUTCOME_SPELL_NAMES = {
     ["Healing Potion"] = "heal",
     ["Greater Healing Potion"] = "heal",
@@ -37,15 +36,14 @@ local SWIFTNESS_AURA = 2379
 local MIN_MANA_GAIN = 200
 local MIN_HEALTH_GAIN = 200
 
--- Seconds between using the satchel and the outcome that we still treat as
--- the same use.
+-- Seconds between using the satchel and its outcome.
 local WINDOW = 5
 
 -- Damage the satchel deals; used only if your health can't be read.
 local OUTCH_DAMAGE = 216
 
--- Cooldowns shorter than this aren't a satchel use (global cooldown, or a
--- 2 minute potion cooldown the satchel might share). The satchel's is 10 min.
+-- Shorter cooldowns aren't a satchel use (global cooldown, or a 2 minute
+-- potion cooldown the satchel might share). The satchel's is 10 minutes.
 local MIN_COOLDOWN = 300
 
 local GetItemCooldownFn = (C_Item and C_Item.GetItemCooldown)
@@ -54,8 +52,8 @@ local GetItemSpellFn = (C_Item and C_Item.GetItemSpell) or GetItemSpell
 local SendChatFn = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
 
 local debugMode = false
-local pendingUses = {}   -- satchel uses not resolved yet: { time }
-local outcomes = {}      -- potion effects seen recently: { key, time }
+local useTime            -- when the satchel was used, until its outcome is counted
+local outcome            -- latest potion effect seen: { key, time }
 local healthLosses = {}  -- recent drops in your health: { time, amount }
 local lastHealth, lastMana
 local hadSwiftness = false
@@ -111,7 +109,6 @@ local function HasSwiftness()
 end
 
 local function SpellName(spellID)
-    if IsSecret(spellID) then return nil end
     if C_Spell and C_Spell.GetSpellName then
         local ok, name = pcall(C_Spell.GetSpellName, spellID)
         if ok then return name end
@@ -120,8 +117,22 @@ local function SpellName(spellID)
     end
 end
 
+local function ReadCooldown()
+    if not GetItemCooldownFn then return nil end
+    local ok, start, duration = pcall(GetItemCooldownFn, SATCHEL_ID)
+    if not ok or type(start) ~= "number" or type(duration) ~= "number" then return nil end
+    if IsSecret(start) or IsSecret(duration) then return nil end
+    return start, duration
+end
+
+local function SatchelSpellID()
+    if not GetItemSpellFn then return nil end
+    local ok, _, spellID = pcall(GetItemSpellFn, SATCHEL_ID)
+    if ok then return spellID end
+end
+
 ---------------------------------------------------------------------------
--- Matching satchel uses to outcomes
+-- Matching a satchel use to its outcome
 ---------------------------------------------------------------------------
 
 -- Largest single health drop around the time the satchel was used.
@@ -138,83 +149,54 @@ end
 local function Resolve()
     local now = GetTime()
 
-    local i = 1
-    while i <= #pendingUses do
-        local use = pendingUses[i]
-        local matched
-        for j, outcome in ipairs(outcomes) do
-            if math.abs(outcome.time - use.time) <= WINDOW then
-                matched = j
-                break
-            end
-        end
-
-        if matched then
-            local key = outcomes[matched].key
-            wipe(outcomes) -- one outcome per use; drop duplicate signals
-            OutchDB[key] = OutchDB[key] + 1
-            table.remove(pendingUses, i)
-            Debug("Counted " .. key)
-        elseif now - use.time > WINDOW then
-            local damage = DamageNear(use.time)
+    if useTime then
+        if outcome and math.abs(outcome.time - useTime) <= WINDOW then
+            OutchDB[outcome.key] = OutchDB[outcome.key] + 1
+            Debug("Counted " .. outcome.key)
+            useTime, outcome = nil, nil
+        elseif now - useTime > WINDOW then
+            local damage = DamageNear(useTime)
             OutchDB.outch = OutchDB.outch + 1
             OutchDB.outchDamage = OutchDB.outchDamage + (damage or OUTCH_DAMAGE)
-            table.remove(pendingUses, i)
             Debug("Counted Outch for " .. (damage or OUTCH_DAMAGE)
                 .. (damage and "" or " (health unreadable, assumed)"))
-        else
-            i = i + 1
+            useTime = nil
         end
     end
 
-    for j = #outcomes, 1, -1 do
-        if now - outcomes[j].time > WINDOW then table.remove(outcomes, j) end
-    end
-    for j = #healthLosses, 1, -1 do
-        if now - healthLosses[j].time > WINDOW * 3 then table.remove(healthLosses, j) end
+    if outcome and now - outcome.time > WINDOW then outcome = nil end
+    for i = #healthLosses, 1, -1 do
+        if now - healthLosses[i].time > WINDOW * 3 then table.remove(healthLosses, i) end
     end
 end
 
-local function AddOutcome(key, how)
-    -- Ignore effects nowhere near a satchel use (e.g. drinking a real potion).
-    local now = GetTime()
-    if now - lastUseTime > WINDOW and #pendingUses == 0 then
-        -- Might still arrive just before the cooldown event; keep it briefly.
-        Debug(key .. " seen (" .. how .. "), waiting for a satchel use")
-    else
-        Debug(key .. " seen (" .. how .. ")")
-    end
-    table.insert(outcomes, { key = key, time = now })
-    Resolve()
-end
-
--- Called by every use-detection path; the satchel's 10 minute cooldown means
+-- Called by every use-detection path. The satchel's 10 minute cooldown means
 -- anything within a few seconds of the last use is the same use.
 local function MarkUse(how)
     local now = GetTime()
     if now - lastUseTime < 10 then return end
     lastUseTime = now
-    table.insert(pendingUses, { time = now })
+    useTime = now
     Debug("Satchel used (" .. how .. ")")
     C_Timer.After(WINDOW + 0.2, Resolve)
     Resolve()
 end
 
+-- An outcome may be seen just before the use is detected, so it's kept for
+-- WINDOW seconds and matched either way round.
+local function AddOutcome(key, how)
+    outcome = { key = key, time = GetTime() }
+    Debug(key .. " seen (" .. how .. ")")
+    Resolve()
+end
+
 local function NearUse()
-    return #pendingUses > 0 or GetTime() - lastUseTime <= WINDOW
+    return useTime ~= nil or GetTime() - lastUseTime <= WINDOW
 end
 
 ---------------------------------------------------------------------------
--- Detecting a use
+-- Event handlers
 ---------------------------------------------------------------------------
-
-local function ReadCooldown()
-    if not GetItemCooldownFn then return nil end
-    local ok, start, duration = pcall(GetItemCooldownFn, SATCHEL_ID)
-    if not ok or type(start) ~= "number" or type(duration) ~= "number" then return nil end
-    if IsSecret(start) or IsSecret(duration) then return nil end
-    return start, duration
-end
 
 local function CheckCooldown()
     local start, duration = ReadCooldown()
@@ -229,16 +211,6 @@ local function CheckCooldown()
     end
 end
 
-local function SatchelSpellID()
-    if not GetItemSpellFn then return nil end
-    local ok, _, spellID = pcall(GetItemSpellFn, SATCHEL_ID)
-    if ok then return spellID end
-end
-
----------------------------------------------------------------------------
--- Watching for outcomes
----------------------------------------------------------------------------
-
 local function OnSpellCast(spellID)
     if IsSecret(spellID) then
         Debug("You cast a spell (hidden by the game)")
@@ -247,8 +219,7 @@ local function OnSpellCast(spellID)
     local name = SpellName(spellID)
     Debug("You cast: " .. tostring(name) .. " (spell " .. tostring(spellID) .. ")")
 
-    local satchelSpell = SatchelSpellID()
-    if satchelSpell and spellID == satchelSpell then
+    if spellID == SatchelSpellID() then
         MarkUse("spell cast")
     end
 
@@ -292,19 +263,14 @@ end
 ---------------------------------------------------------------------------
 
 local frame = CreateFrame("Frame")
-
-local function SafeRegister(event)
-    pcall(frame.RegisterEvent, frame, event)
-end
-
-SafeRegister("ADDON_LOADED")
-SafeRegister("PLAYER_ENTERING_WORLD")
-SafeRegister("BAG_UPDATE_COOLDOWN")
-SafeRegister("SPELL_UPDATE_COOLDOWN")
-pcall(frame.RegisterUnitEvent, frame, "UNIT_SPELLCAST_SUCCEEDED", "player")
-pcall(frame.RegisterUnitEvent, frame, "UNIT_HEALTH", "player")
-pcall(frame.RegisterUnitEvent, frame, "UNIT_POWER_UPDATE", "player")
-pcall(frame.RegisterUnitEvent, frame, "UNIT_AURA", "player")
+frame:RegisterEvent("ADDON_LOADED")
+frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("BAG_UPDATE_COOLDOWN")
+frame:RegisterEvent("SPELL_UPDATE_COOLDOWN")
+frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
+frame:RegisterUnitEvent("UNIT_HEALTH", "player")
+frame:RegisterUnitEvent("UNIT_POWER_UPDATE", "player")
+frame:RegisterUnitEvent("UNIT_AURA", "player")
 
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
@@ -353,8 +319,7 @@ SlashCmdList["OUTCH"] = function(arg)
         debugMode = not debugMode
         Print("Outch: debug " .. (debugMode and "on" or "off") .. ".")
         if debugMode then
-            local start = ReadCooldown()
-            Debug("Satchel cooldown readable: " .. (start and "yes" or "no")
+            Debug("Satchel cooldown readable: " .. (ReadCooldown() and "yes" or "no")
                 .. ", satchel spell: " .. tostring(SatchelSpellID())
                 .. ", health readable: " .. (ReadHealth() and "yes" or "no")
                 .. ", mana readable: " .. (ReadMana() and "yes" or "no"))
